@@ -3,6 +3,7 @@ import { WebSocketServer } from "ws";
 import { spawn, ChildProcess } from "child_process";
 import cors from "cors";
 import { IncomingMessage, ServerResponse } from "http";
+import * as pty from 'node-pty';
 
 const app = express();
 const HTTP_PORT = 3000;
@@ -13,6 +14,46 @@ app.use(express.json());
 app.get('/status', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
+
+const terminalWss = new WebSocketServer({ noServer: true });
+
+terminalWss.on('connection', (ws) => {
+  console.log('Terminal client connected');
+  const shell = process.env.SHELL || 'bash';
+  
+  const ptyProcess = pty.spawn(shell, [], {
+    name: 'xterm-color',
+    cols: 80,
+    rows: 30,
+    cwd: process.env.HOME,
+    env: process.env as any
+  });
+
+  ptyProcess.onData((data) => {
+    if (ws.readyState === ws.OPEN) {
+      ws.send(data);
+    }
+  });
+
+  ws.on('message', (msg) => {
+    try {
+      const message = JSON.parse(msg.toString());
+      if (message.type === 'input') {
+        ptyProcess.write(message.data);
+      } else if (message.type === 'resize') {
+        ptyProcess.resize(message.cols, message.rows);
+      }
+    } catch (e) {
+      console.error('Error parsing terminal message:', e);
+    }
+  });
+
+  ws.on('close', () => {
+    console.log('Terminal client disconnected');
+    ptyProcess.kill();
+  });
+});
+
 const wss = new WebSocketServer({ 
   port: WS_PORT,
   host: '0.0.0.0' 
@@ -37,7 +78,7 @@ function startFFmpeg() {
     "pipe:1"                
   ], { stdio: ["pipe", "pipe", "inherit"] });
   ffmpeg.stdout?.on("data", (chunk: Buffer) => {
-    console.log(`ffmpeg output: ${chunk.length} bytes to ${httpClients.length} clients`);
+    // console.log(`ffmpeg output: ${chunk.length} bytes to ${httpClients.length} clients`);
     httpClients.forEach(res => {
       try {
         res.write(chunk);
@@ -75,7 +116,6 @@ function stopFFmpeg() {
   }
 }
 
-// WebSocket connection handler
 wss.on("connection", (ws) => {
   console.log("Mobile client connected via WebSocket");
 
@@ -89,7 +129,7 @@ wss.on("connection", (ws) => {
           startFFmpeg();
         }
         const buffer = Buffer.from(data.data, "base64");
-        console.log(`Received frame: ${buffer.length} bytes`);
+        // console.log(`Received frame: ${buffer.length} bytes`);
         
         if (ffmpeg && ffmpeg.stdin && ffmpeg.stdin.writable && !ffmpeg.stdin.destroyed) {
           try {
@@ -156,10 +196,22 @@ app.get("/status", (req, res) => {
     wsConnections: wss.clients.size
   });
 });
-app.listen(HTTP_PORT, '0.0.0.0', () => {
+const server = app.listen(HTTP_PORT, '0.0.0.0', () => {
   console.log(`HTTP server listening on http://0.0.0.0:${HTTP_PORT}`);
   console.log(`MJPEG stream available at http://0.0.0.0:${HTTP_PORT}/stream.mjpeg`);
   console.log(`\n✅ Server ready! Connect from phone using: http://10.254.203.23:${HTTP_PORT}`);
+});
+
+server.on('upgrade', (request, socket, head) => {
+  const pathname = request.url ? new URL(request.url, `http://${request.headers.host}`).pathname : '';
+
+  if (pathname === '/terminal') {
+    terminalWss.handleUpgrade(request, socket, head, (ws) => {
+      terminalWss.emit('connection', ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
 });
 
 process.on("SIGINT", () => {
